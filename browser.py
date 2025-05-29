@@ -1,8 +1,12 @@
+import json
 import ast
+import random
+import asyncio
 import base64
 import os
 import shutil
 import time
+import ua_generator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
@@ -16,7 +20,7 @@ from .agent import fetch_query_for_rag, get_reply, summarize_text
 
 
 def call_process_image_api(
-    image_path, box_threshold=0.05, iou_threshold=0.1, timeout=30
+    image_path, box_threshold=0.05, iou_threshold=0.1, timeout=60
 ):
     start = time.time()
     url = os.environ.get("OMNIPARSER_API")
@@ -26,14 +30,17 @@ def call_process_image_api(
     files = {"image_file": ("image.png", image_data, "image/png")}
     params = {"box_threshold": box_threshold, "iou_threshold": iou_threshold}
 
-    response = requests.post(url, files=files, params=params, timeout=timeout)
-
-    if response.status_code == 200:
-        resp = response.json()
-        print(f"Image API call took: {time.time() - start:.2f}s")
-        return resp["image"], resp["parsed_content_list"], resp["label_coordinates"]
-    else:
-        raise Exception(f"Request failed with status code {response.status_code}")
+    for attempt in range(2):
+        response = requests.post(url, files=files, params=params, timeout=timeout)
+        if response.status_code == 200:
+            resp = response.json()
+            return resp["image"], resp["parsed_content_list"], resp["label_coordinates"]
+        else:
+            if attempt == 1:
+                raise Exception(
+                    f"Request failed with status code {response.status_code}"
+                )
+            time.sleep(1)  # Wait a bit before retrying
 
 
 # wake up the server
@@ -285,7 +292,11 @@ class PlaywrightExecutor:
 
 
 class WebScraper:
-    def __init__(self, task, start_url, output_model: BaseModel):
+    def __init__(self, task, start_url, output_model: BaseModel, callback=None):
+        self.logs = []
+        self.log_callback = callback
+
+        self._log("Initializing WebScraper...")
         self.task = task
         self.start_url = start_url
         index_path = "output/index"
@@ -295,11 +306,23 @@ class WebScraper:
         self.web_processor = WebPageProcessor()
         self.output_model = output_model
         self.browser = None
+        self.iteration_count = 0
+        self._log("Done initializing WebScraper")
+
+    def _log(self, message):
+        self.logs.append(message)
+        if self.log_callback:
+            self.log_callback(message)
 
     async def main(self, p):
         # locally
+        self._log("Starting browser...")
         self.browser = await p.chromium.launch(
             headless=True,
+        )
+
+        user_agent = ua_generator.generate(
+            device="desktop",
         )
 
         context = await self.browser.new_context(
@@ -316,21 +339,27 @@ class WebScraper:
         next_action = f'load(url="{self.start_url}")'
         second_action = None
         max_iterations = 30
-        iteration_count = 0
+        self.iteration_count = 0
         state = [
             {
                 "role": "user",
-                "content": "Overall goal: " + self.task,
-            }
+                "content": f"""Overall goal: {self.task}. Try to find the following information in your search: {self.output_model["properties"]}""",
+            },
+            {
+                "role": "assistant",
+                "content": "Okay. Let's get started.",
+            },
         ]
-        while next_task and iteration_count < max_iterations:
+        while next_task and self.iteration_count < max_iterations:
             executor = PlaywrightExecutor(page, self.web_processor)
+            self._log(f"> Executing action {next_action}")
             await executor.execute_action(next_action)
             time.sleep(1)
             if second_action:
+                self._log(f"> Executing second action {second_action}")
                 await executor.execute_action(second_action)
                 time.sleep(1)
-            print("> Inspecting the screen...")
+            self._log("> Inspecting the screen...")
             start_time = datetime.now()
             await page.screenshot(path="screenshot.png", scale="css")
             img, parsed, coordinates = call_process_image_api(
@@ -343,7 +372,7 @@ class WebScraper:
                 f.write(image_data)
 
             end_time = datetime.now()
-            print(f"Inspection took: {(end_time - start_time).total_seconds()}s")
+            self._log(f"Inspection took: {(end_time - start_time).total_seconds()}s")
             self.web_processor.load_elements(parsed, coordinates)
             text_content = " ".join(
                 [
@@ -371,17 +400,21 @@ class WebScraper:
                     # ],
                 }
             )
-            print("> Getting reply from AI...")
+            self._log("> Getting reply from AI...")
             start_time = datetime.now()
             reply = get_reply(state)
-            print("> AI time taken:", (datetime.now() - start_time).total_seconds())
+            self._log(
+                f"> AI time taken: {(datetime.now() - start_time).total_seconds()}"
+            )
 
             next_task, next_action, second_action = (
                 reply["next_task"],
                 reply["next_action"],
                 reply.get("next_action_2"),
             )
-            print("> next_task", next_task, next_action, second_action)
+            self._log(
+                f"> Next_task: {next_task}, Next action: {next_action}, Second action: {second_action}"
+            )
             state.append(
                 {
                     "role": "assistant",
@@ -389,11 +422,11 @@ class WebScraper:
                 }
             )
 
-            if next_action == "nothing":
-                print("> No further action required.")
-                iteration_count += 1000
+            if next_action == "nothing" or next_action is None:
+                self._log("> No further action required.")
+                self.iteration_count += 1000
             else:
-                iteration_count += 1
+                self.iteration_count += 1
         return page, context
 
     async def run(self):
@@ -402,11 +435,11 @@ class WebScraper:
             page, context = await self.main(p)
 
             rag_query = fetch_query_for_rag(self.task)
-            print("> Querying RAG for task:", rag_query)
+            self._log(f"> Querying RAG for task: {rag_query}")
             docs = [a["text"] for a in self.rag.query(rag_query)]
             answer = summarize_text(self.task, docs, self.output_model)
-            print("> Answer:", answer)
-            print("> Total time taken:", time.time() - start)
+            # self._log(f"> Answer: {answer}")
+            self._log(f"> Total time taken: {time.time() - start}")
 
             try:
                 await context.close()

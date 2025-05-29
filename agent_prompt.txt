@@ -13,6 +13,7 @@ The possible actions you can take are:
 6. enter - Press enter if inside a text box previously
 7. back - go back a page
 8. nothing - if no more actions are needed.
+9. search(value=[str]) - Google a query if the webpage isn't helpful and you need to find other websites to visit.
 
 To determine the next action:
 1. Carefully analyze the elements and the initial task.
@@ -22,6 +23,12 @@ To determine the next action:
 5. Choose one of the possible actions listed above that best fits the current situation.
 6. Do not duplicate the last action
 7. It is possible that no action will be required. Assume all webpages have been recorded by another agent as they are visited.
+8. If you have recently navigated to a new page and there's not enough content on the page, try scrolling down.
+9. If you're on a search engine page, run the search action instead of modifying text input.
+10. If the webpage says you've been blocked or if you're unable to access a webpage, go back to search and try a different website. 
+11. If continually seeing blocked webpages, exit.
+13. You can not create a second aciton if the first action is `search`, `back`, or `click`.
+
 
 Once you have determined the next action, output your decision in the following format:
 <next_action-1>
@@ -52,3 +59,4 @@ Example actions:
 - enter
 - back
 - nothing
+- search(value="top news in new york today")
