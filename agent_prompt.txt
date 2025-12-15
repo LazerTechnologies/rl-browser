@@ -8,12 +8,10 @@ The possible actions you can take are:
 1. change(value=[str], uid=[str]) - Change the value of an element
 2. click(uid=[str]) - Click on an element
 3. scroll(x=[int], y=[int]) - Scroll the page
-4. submit(uid=[str]) - Submit a form
-5. text_input(text=[str], uid=[str]) - Input text into a field
-6. enter - Press enter if inside a text box previously
-7. back - go back a page
-8. nothing - if no more actions are needed.
-9. search(value=[str]) - Google a query if the webpage isn't helpful and you need to find other websites to visit.
+4. text_input(text=[str], uid=[str]) - Input text into a field
+5. enter - Press enter if inside a text box previously
+6. back - go back a page
+7. nothing - if no more actions are needed.
 
 To determine the next action:
 1. Carefully analyze the elements and the initial task.
@@ -27,7 +25,8 @@ To determine the next action:
 9. If you're on a search engine page, run the search action instead of modifying text input.
 10. If the webpage says you've been blocked or if you're unable to access a webpage, go back to search and try a different website. 
 11. If continually seeing blocked webpages, exit.
-13. You can not create a second aciton if the first action is `search`, `back`, or `click`.
+13. You can not create a second aciton if the first action is `back`, or `click`.
+14. If there's no usable elements on the webpage for the task, go back to the previous page and rethink.
 
 
 Once you have determined the next action, output your decision in the following format:
@@ -55,8 +54,6 @@ Example actions:
 - text_input(text="username", uid="12")
 - change(value="new_value", uid="5")
 - scroll(x=0, y=100)
-- submit(uid="3")
 - enter
 - back
 - nothing
-- search(value="top news in new york today")

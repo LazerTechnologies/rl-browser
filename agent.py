@@ -99,9 +99,9 @@ def get_reply(state, model: str = "gemini/gemini-2.5-pro") -> str:
     reply = (
         completion(
             model=full_model_name,
-            max_tokens=256,
+            # max_tokens=int(256 * 1.5),
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + state,
-            temperature=0.3,
+            temperature=0.5,
         )
         .choices[0]
         .message.content
