@@ -11,175 +11,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Union
 
-import requests
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Page, async_playwright, ElementHandle
 from pydantic import BaseModel
 
-from .index import RAGSystem
-from .agent import fetch_query_for_rag, get_reply, summarize_text
+from utils import DOMSimplifier
 
-
-def call_process_image_api(
-    image_path, box_threshold=0.05, iou_threshold=0.1, timeout=60
-):
-    start = time.time()
-    url = os.environ.get("OMNIPARSER_API")
-    with open(image_path, "rb") as image_file:
-        image_data = image_file.read()
-
-    files = {"image_file": ("image.png", image_data, "image/png")}
-    params = {"box_threshold": box_threshold, "iou_threshold": iou_threshold}
-
-    for attempt in range(2):
-        response = requests.post(url, files=files, params=params, timeout=timeout)
-        if response.status_code == 200:
-            resp = response.json()
-            return resp["image"], resp["parsed_content_list"], resp["label_coordinates"]
-        else:
-            if attempt == 1:
-                raise Exception(
-                    f"Request failed with status code {response.status_code}"
-                )
-            time.sleep(1)  # Wait a bit before retrying
-
-
-# wake up the server
-try:
-    call_process_image_api("downloaded_image.png", 0.05, 0.1, timeout=60)
-except Exception:
-    pass
-
-
-@dataclass
-class WebElement:
-    id: int
-    text: str
-    x: float
-    y: float
-    width: float
-    height: float
-    element_type: str  # 'text' or 'icon'
-
-    @property
-    def center(self) -> Tuple[float, float]:
-        """Returns the center coordinates of the element"""
-        return (self.x + (self.width / 2), self.y + (self.height / 2))
-
-    @property
-    def bounds(self) -> Tuple[float, float, float, float]:
-        """Returns the boundary coordinates (x1, y1, x2, y2)"""
-        return (self.x, self.y, self.x + self.width, self.y + self.height)
-
-
-class WebPageProcessor:
-    def __init__(self):
-        self.elements: Dict[int, WebElement] = {}
-
-    def load_elements(self, text_boxes: str, coordinates: str) -> None:
-        """
-        Load elements from the processed webpage data
-
-        Args:
-            text_boxes: String mapping ID to text content
-            coordinates: String mapping ID to [x, y, width, height] lists
-        """
-
-        self.elements = {}
-
-        def parse_text_boxes(text: str) -> dict:
-            # Split into lines and filter empty lines
-            lines = [line.strip() for line in text.split("\n") if line.strip()]
-
-            # Dictionary to store results
-            boxes = {}
-
-            for line in lines:
-                # Split on ":" to separate ID from text
-                id_part, text_part = line.split(":", 1)
-
-                # Extract ID number using string operations
-                id_str = id_part.split("ID")[1].strip()
-                id_num = int(id_str)
-
-                # Store in dictionary with cleaned text
-                boxes[id_num] = text_part.strip()
-
-            return boxes
-
-        def parse_coordinates(coords: str) -> dict:
-            """
-            Example string:
-            `{'0': [0.89625, 0.04333332697550456, 0.06125, 0.03], '1': [0.01875, 0.14499998728434244, 0.34875, 0.03833333333333333]}`
-            """
-            return ast.literal_eval(coords)
-
-        coordinates = parse_coordinates(coordinates)
-        for element_id, text in parse_text_boxes(text_boxes).items():
-            id_str = str(element_id)
-            if id_str in coordinates:
-                coords = coordinates[id_str]
-                element_type = "icon" if "Icon Box" in text else "text"
-
-                self.elements[element_id] = WebElement(
-                    id=element_id,
-                    text=text.strip(),
-                    x=coords[0],
-                    y=coords[1],
-                    width=coords[2],
-                    height=coords[3],
-                    element_type=element_type,
-                )
-
-    async def click_element(self, page, element_id: int) -> None:
-        """Click an element using its center coordinates"""
-        if element_id not in self.elements:
-            raise ValueError(f"Element ID {element_id} not found")
-
-        element = self.elements[element_id]
-        x, y = element.center
-
-        # Convert normalized coordinates to actual pixels
-        viewport_size = await page.viewport()
-        actual_x = x * viewport_size["width"]
-        actual_y = y * viewport_size["height"]
-
-        await page.mouse.click(actual_x, actual_y)
-
-    def find_elements_by_text(
-        self, text: str, partial_match: bool = True
-    ) -> List[WebElement]:
-        """Find elements containing the specified text"""
-        matches = []
-        for element in self.elements.values():
-            if partial_match and text.lower() in element.text.lower():
-                matches.append(element)
-            elif not partial_match and text.lower() == element.text.lower():
-                matches.append(element)
-        return matches
-
-    def get_nearby_elements(
-        self, element_id: int, max_distance: float = 0.1
-    ) -> List[WebElement]:
-        """Find elements within a certain distance of the specified element"""
-        if element_id not in self.elements:
-            raise ValueError(f"Element ID {element_id} not found")
-
-        source = self.elements[element_id]
-        nearby = []
-
-        for element in self.elements.values():
-            if element.id == element_id:
-                continue
-
-            # Calculate center-to-center distance
-            sx, sy = source.center
-            ex, ey = element.center
-            distance = ((sx - ex) ** 2 + (sy - ey) ** 2) ** 0.5
-
-            if distance <= max_distance:
-                nearby.append(element)
-
-        return nearby
+# from .index import RAGSystem
+from agent import fetch_query_for_rag, get_reply, summarize_text
 
 
 @dataclass
@@ -189,39 +27,58 @@ class Action:
 
 
 class PlaywrightExecutor:
-    def __init__(self, page: Page, web_processor: "WebPageProcessor"):
+    def __init__(self, page: Page):
         self.page = page
-        self.processor = web_processor
+        self.elements = {}
 
-    async def execute_action(self, action_str: str) -> None:
+    async def get_dom(self) -> str:
+        return await self.page.content()
+
+    async def execute_action(
+        self, action_str: str, elements: Dict[str, ElementHandle]
+    ) -> None | str:
         """Execute a Playwright action from a string command."""
-        print("> Executing action:", action_str)
         action = self.parse_action(action_str)
-        element = None
-        if "uid" in action.params:
-            element = self.processor.elements.get(int(action.params["uid"]))
-            if not element:
-                raise ValueError(f"Element with uid {action.params['uid']} not found")
+        self.elements = elements
+        # start_time = time.time()
+        element = action.params["uid"] if "uid" in action.params else None
         if action.action_type == "click":
-            await self._execute_click(element)
+            if not element:
+                raise ValueError(f"Element with id {action.params['uid']} not found")
+            try:
+                await self._execute_click(element)
+            except Exception as e:
+                if "waiting for element to be visible" in str(e):
+                    return f"Element not interactable"
+                else:
+                    raise e
+
         elif action.action_type == "text_input":
+            if not element:
+                raise ValueError(f"Element with id {action.params['uid']} not found")
             await self._execute_change(element, action.params["text"])
         elif action.action_type == "change":
+            if not element:
+                raise ValueError(f"Element with id {action.params['uid']} not found")
             await self._execute_change(element, action.params["value"])
-        elif action.action_type == "load":
-            await self._execute_load(action.params["url"])
         elif action.action_type == "scroll":
             await self._execute_scroll(int(action.params["x"]), int(action.params["y"]))
         elif action.action_type == "submit":
+            if not element:
+                raise ValueError(f"Element with id {action.params['uid']} not found")
             await self._execute_submit(element)
         elif action.action_type == "back":
             await self.page.go_back()
         elif action.action_type == "enter":
             await self.page.keyboard.press("Enter")
+        elif action.action_type == "load":
+            await self._execute_load(action.params["url"])
         elif action.action_type == "nothing":
             pass
         else:
             raise ValueError(f"Unknown action type: {action.action_type}")
+
+        # print("> Action time taken:", time.time() - start_time)
 
     def parse_action(self, action_str: str) -> Action:
         """Parse an action string into an Action object."""
@@ -243,31 +100,36 @@ class PlaywrightExecutor:
                 params[key] = value
         return Action(action_type=action_type, params=params)
 
-    async def _execute_click(self, element: "WebElement") -> None:
-        """Execute a click action."""
-        x, y = element.center
-        viewport = self.page.viewport_size
-        actual_x = x * viewport["width"]
-        actual_y = y * viewport["height"]
-        await self.page.mouse.move(actual_x, actual_y)
-        await self.page.mouse.click(actual_x, actual_y, delay=100)
+    async def find_element_by_reference(self, ref_id: int) -> ElementHandle:
+        selector = self.elements.get(int(ref_id))
 
-    async def _execute_text_input(self, element: "WebElement", text: str) -> None:
+        if not selector:
+            raise ValueError(
+                f"Element with reference id {ref_id} not found", self.elements
+            )
+
+        element_handle = self.elements.get(int(ref_id), None)
+        if not element_handle:
+            raise ValueError(f"Could not find element matching: {selector}")
+
+        return element_handle
+
+    async def _execute_click(self, element_id: int) -> None:
+        """Execute a click action."""
+        element_handle = await self.find_element_by_reference(element_id)
+        await element_handle.click(timeout=5000)
+
+    async def _execute_text_input(self, element_id: int, text: str) -> None:
         """Execute a text input action."""
-        x, y = element.center
-        viewport = self.page.viewport_size
-        actual_x = x * viewport["width"]
-        actual_y = y * viewport["height"]
-        await self.page.mouse.click(actual_x, actual_y, delay=100)
+        element_handle = await self.find_element_by_reference(element_id)
+        await element_handle.click(timeout=5000)
         await self.page.keyboard.type(text, delay=100)
 
-    async def _execute_change(self, element: "WebElement", value: str) -> None:
+    async def _execute_change(self, element_id: int, value: str) -> None:
         """Execute a change action."""
-        x, y = element.center
-        viewport = self.page.viewport_size
-        actual_x = x * viewport["width"]
-        actual_y = y * viewport["height"]
-        await self.page.mouse.click(actual_x, actual_y)
+        # TODO: May need to "click" the x+y of the element to set focus first
+        element_handle = await self.find_element_by_reference(element_id)
+        await element_handle.focus()
         await self.page.keyboard.down("Meta")
         await self.page.keyboard.press("A")
         await self.page.keyboard.up("Meta")
@@ -282,13 +144,10 @@ class PlaywrightExecutor:
         await self.page.evaluate(f"window.scrollTo({x}, {y})")
         await self.page.wait_for_timeout(1000)
 
-    async def _execute_submit(self, element: "WebElement") -> None:
-        """Execute a submit action."""
-        x, y = element.center
-        viewport = self.page.viewport_size
-        actual_x = x * viewport["width"]
-        actual_y = y * viewport["height"]
-        await self.page.mouse.click(actual_x, actual_y)
+    # async def _execute_submit(self, element_id: int) -> None:
+    #     """Execute a submit action."""
+    #     x, y = await self.find_element_by_reference(element_id)
+    #     await self.page.mouse.click(x, y, delay=100)
 
 
 class WebScraper:
@@ -302,8 +161,7 @@ class WebScraper:
         index_path = "output/index"
         if os.path.exists(index_path):
             shutil.rmtree(index_path)
-        self.rag = RAGSystem(index_path="output/index")
-        self.web_processor = WebPageProcessor()
+        # self.rag = RAGSystem(index_path="output/index")
         self.output_model = output_model
         self.browser = None
         self.iteration_count = 0
@@ -325,12 +183,14 @@ class WebScraper:
             device="desktop",
         )
 
+        size = {"width": 1920, "height": 1080}
+
         context = await self.browser.new_context(
             record_video_dir="videos/",
-            record_video_size={"width": 1920, "height": 1080},
+            record_video_size=size,
         )
         page = await context.new_page()
-        await page.set_viewport_size({"width": 1920, "height": 1080})
+        await page.set_viewport_size(size)
         next_task = (
             "Find the website to visit."
             if "google.com" in self.start_url
@@ -343,63 +203,73 @@ class WebScraper:
         state = [
             {
                 "role": "user",
-                "content": f"""Overall goal: {self.task}. Try to find the following information in your search: {self.output_model["properties"]}""",
+                "content": f"""Overall goal: {self.task}. Try to find the following information in your search: {self.output_model.model_json_schema()['$defs'] if '$defs' in self.output_model.model_json_schema() else self.output_model.model_json_schema()['properties']}""",
             },
             {
                 "role": "assistant",
                 "content": "Okay. Let's get started.",
             },
         ]
+        simplifier = DOMSimplifier()
+        executor = PlaywrightExecutor(page)
+        elements, elements_id_map = await simplifier.parse(executor.page)
         while next_task and self.iteration_count < max_iterations:
-            executor = PlaywrightExecutor(page, self.web_processor)
             self._log(f"> Executing action {next_action}")
-            await executor.execute_action(next_action)
+            error_response = await executor.execute_action(next_action, elements_id_map)
             time.sleep(1)
-            if second_action:
-                self._log(f"> Executing second action {second_action}")
-                await executor.execute_action(second_action)
-                time.sleep(1)
-            self._log("> Inspecting the screen...")
-            start_time = datetime.now()
-            await page.screenshot(path="screenshot.png", scale="css")
-            img, parsed, coordinates = call_process_image_api(
-                "screenshot.png", 0.2, 0.1
-            )
+            # TODO: temp disable second action
+            # if second_action and not error_response:
+            #     self._log(f"> Executing second action {second_action}")
 
-            # Save the base64 image locally as "screenshot.png"
-            image_data = base64.b64decode(img)
-            with open("screenshot.png", "wb") as f:
-                f.write(image_data)
+            #     # elements, elements_id_map = await simplifier.parse(executor.page)
+            #     error_response = await executor.execute_action(
+            #         second_action, elements_id_map
+            #     )
+            #     time.sleep(1)
 
-            end_time = datetime.now()
-            self._log(f"Inspection took: {(end_time - start_time).total_seconds()}s")
-            self.web_processor.load_elements(parsed, coordinates)
-            text_content = " ".join(
-                [
-                    a.text
-                    for a in self.web_processor.elements.values()
-                    if a.element_type == "text"
-                ]
-            )
-            self.rag.add_document(
-                text_content,
-                {"url": page.url, "timestamp": datetime.now().isoformat()},
-            )
-            state.append(
-                {
-                    "role": "user",
-                    "content": "Elements on screen: " + parsed,
-                    # {
-                    #     "type": "image",
-                    #     "source": {
-                    #         "type": "base64",
-                    #         "media_type": "image/png",
-                    #         "data": img,
-                    #     },
-                    # },
-                    # ],
-                }
-            )
+            # save
+            elements, elements_id_map = await simplifier.parse(executor.page)
+            print("> Parsed DOM, preparing to send to AI...")
+            await executor.page.screenshot(path="screenshot.png", scale="css")
+            # self.rag.add_document(
+            #     elements,
+            #     {"url": page.url, "timestamp": datetime.now().isoformat()},
+            # )
+            # self._log(f"> Elements on page: {elements}")
+
+            # with open("screenshot.png", "rb") as img_file:
+            #     img = base64.b64encode(img_file.read()).decode("utf-8")
+
+            if error_response:
+                self._log(f"> Error response: {error_response}")
+                state.append(
+                    {
+                        "role": "user",
+                        "content": f"Error encountered during action execution: {error_response}",
+                    }
+                )
+            else:
+                state.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Current URL: {page.url}"},
+                            {
+                                "type": "text",
+                                "text": "Elements on screen:\n" + elements,
+                            },
+                            # {
+                            #     "type": "image_url",
+                            #     "image_url": {
+                            #         # "type": "base64",
+                            #         # "media_type": "image/png",
+                            #         "url": f"data:image/png;base64,{img}",
+                            #     },
+                            # },
+                        ],
+                        # ],
+                    }
+                )
             self._log("> Getting reply from AI...")
             start_time = datetime.now()
             reply = get_reply(state)
@@ -434,10 +304,10 @@ class WebScraper:
             start = time.time()
             page, context = await self.main(p)
 
-            rag_query = fetch_query_for_rag(self.task)
-            self._log(f"> Querying RAG for task: {rag_query}")
-            docs = [a["text"] for a in self.rag.query(rag_query)]
-            answer = summarize_text(self.task, docs, self.output_model)
+            # rag_query = fetch_query_for_rag(self.task)
+            # self._log(f"> Querying RAG for task: {rag_query}")
+            # docs = [a["text"] for a in self.rag.query(rag_query)]
+            # answer = summarize_text(self.task, docs, self.output_model)
             # self._log(f"> Answer: {answer}")
             self._log(f"> Total time taken: {time.time() - start}")
 
@@ -446,4 +316,4 @@ class WebScraper:
             except Exception as e:
                 raise Warning(e)
 
-        return answer
+        # return answer
